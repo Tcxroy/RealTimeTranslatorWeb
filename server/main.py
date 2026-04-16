@@ -1,36 +1,37 @@
 """
 SyncVoice Server — MacBook Pro M4 · 36GB Unified Memory
-FastAPI + WebSocket + Faster-Whisper + Silero VAD + Ollama
+FastAPI + WebSocket + Cohere Transcribe + Silero VAD + Ollama
 
 Pipeline:
   Client (audio PCM chunks)
     → WebSocket
       → VAD (silero-vad, CPU/ANE)
-        → Faster-Whisper  (tiny / base / small / medium / large-v3, selectable)
+        → Cohere Transcribe  (CohereLabs/cohere-transcribe-03-2026, 2B params)
           → Ollama  (qwen3.5:9b / translategemma:4b / translategemma:12b)
             → Streaming JSON  → Client
 
-Whisper model speed guide (Apple Silicon, int8):
-  tiny        ~0.3s   (WER↑, ok for simple speech)
-  base        ~0.5s   (good balance for everyday speech)
-  small       ~1-2s   ← DEFAULT: best speed/accuracy for simultaneous interp
-  medium      ~4-6s
-  large-v3    ~15-25s (highest accuracy, too slow for live interp)
+Cohere Transcribe notes:
+  - 2B parameter open-source ASR model, Apache 2.0 license
+  - Best-in-class WER across 14 languages (incl. Dutch/nl)
+  - Requires explicit language code — no auto-detect
+  - Runs well on Apple Silicon (MPS) or CPU
+  - Model loads from HuggingFace on first run (~4GB download)
 """
 
 import asyncio
+import base64
 import json
 import logging
+import os
 import time
-from collections import deque
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
 import numpy as np
-import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from faster_whisper import WhisperModel
+import mlx_whisper
 
 # ─────────────────────────────────────────────
 #  Logging
@@ -45,16 +46,19 @@ log = logging.getLogger("syncvoice")
 # ─────────────────────────────────────────────
 #  Config  (edit here or via env)
 # ─────────────────────────────────────────────
-# Whisper model options (fast → accurate):
-#   tiny | base | small | medium | large-v3 | distil-large-v3
-# "small" is the recommended default for simultaneous interpretation:
-#   ~1-2s latency on M4, good accuracy for most languages incl. Dutch (nl).
-WHISPER_MODEL     = "small"             # ← changed from large-v3 for real-time use
-WHISPER_DEVICE    = "cpu"               # M4 uses CPU+CoreML; set "cuda" on NVIDIA
-WHISPER_COMPUTE   = "int8"             # int8 = fast + low memory on Apple Silicon
+# MLX-Whisper 模型配置 (Apple Silicon 优化)
+# 注意: MLX-Whisper 使用专门为 MLX 优化的模型，不是标准的 openai/whisper 模型
+WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"  # large-v3-turbo on M4 36GB
+WHISPER_LANGUAGE = None  # None = auto-detect
+
+# ── Energy-based VAD (no extra deps) ───────────────────────────────────────
+# RMS energy gate — faster and more reliable than Silero for real-time use
+ENERGY_VAD_THRESHOLD = 0.01   # RMS amplitude (0..1).  Raise if too sensitive in noisy room.
+ENERGY_VAD_HANGOVER  = 3      # keep "voice=True" for this many frames after energy drops
+
 OLLAMA_BASE_URL   = "http://localhost:11434"
 DEFAULT_LLM       = "qwen3.5:9b"       # translategemma:4b | translategemma:12b
-SAMPLE_RATE       = 16000              # Hz  (Whisper expects 16kHz mono PCM float32)
+SAMPLE_RATE       = 16000              # Hz  (Cohere Transcribe expects 16kHz mono float32)
 
 # ── VAD / segmentation ─────────────────────────────────────────────────────
 # Each "frame" = one ScriptProcessor callback = 4096 samples @ 16kHz ≈ 256ms
@@ -78,11 +82,13 @@ CONTEXT_WORDS     = 5                  # last N words carried as context overlap
 MAX_ANCHORS       = 6                  # keep most recent K anchors in system prompt
 CHUNK_MS          = 256               # expected client chunk size (ms) — matches ScriptProcessor
 
-# Supported Whisper models for the /config/whisper endpoint
-WHISPER_MODEL_OPTIONS = ["tiny", "base", "small", "medium", "large-v3", "distil-large-v3"]
-
 # Supported LLM models
 LLM_MODEL_OPTIONS = ["qwen3.5:9b", "translategemma:4b", "translategemma:12b"]
+
+# MLX-Whisper 支持的语言（99 种语言）
+WHISPER_SUPPORTED_LANGS = [
+    'af', 'am', 'ar', 'as', 'az', 'ba', 'be', 'bg', 'bn', 'bo', 'br', 'bs', 'ca', 'cs', 'cy', 'da', 'de', 'dv', 'el', 'en', 'es', 'et', 'eu', 'fa', 'fi', 'fo', 'fr', 'gl', 'gu', 'ha', 'haw', 'he', 'hi', 'hr', 'ht', 'hu', 'hy', 'id', 'is', 'it', 'ja', 'jw', 'ka', 'kk', 'km', 'kn', 'ko', 'la', 'lb', 'ln', 'lo', 'lt', 'lv', 'mg', 'mi', 'mk', 'ml', 'mn', 'mr', 'ms', 'mt', 'my', 'ne', 'nl', 'nn', 'no', 'oc', 'pa', 'pl', 'ps', 'pt', 'ro', 'ru', 'sa', 'sd', 'si', 'sk', 'sl', 'sn', 'so', 'sq', 'sr', 'su', 'sv', 'sw', 'ta', 'te', 'tg', 'th', 'tk', 'tl', 'tr', 'tt', 'uk', 'ur', 'uz', 'vi', 'yi', 'yo', 'zh'
+]
 
 # Language code to full name mapping for LLM prompts
 LANGUAGE_NAMES = {
@@ -99,12 +105,24 @@ LANGUAGE_NAMES = {
     'ko': 'Korean',
     'ar': 'Arabic',
     'hi': 'Hindi',
+    'el': 'Greek',
+    'pl': 'Polish',
+    'vi': 'Vietnamese',
 }
+
+# ─────────────────────────────────────────────
+#  Lifespan (replaces deprecated on_event)
+# ─────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("Server ready — using MLX-Whisper %s for ASR", WHISPER_MODEL)
+    log.info("MLX-Whisper models are loaded on-demand from HuggingFace (~3GB for large-v3-turbo)")
+    yield
 
 # ─────────────────────────────────────────────
 #  App bootstrap
 # ─────────────────────────────────────────────
-app = FastAPI(title="SyncVoice", version="1.0.0")
+app = FastAPI(title="SyncVoice", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -112,101 +130,66 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─────────────────────────────────────────────
-#  Model singletons  (loaded once at startup)
-# ─────────────────────────────────────────────
-whisper_model: Optional[WhisperModel] = None
-whisper_model_name: str = WHISPER_MODEL   # tracks currently loaded model name
-vad_model = None
-vad_utils = None
 
-
-def _load_whisper(model_name: str):
-    """Load (or reload) a Faster-Whisper model by name."""
-    global whisper_model, whisper_model_name
-    log.info("Loading Faster-Whisper  %s  [%s / %s] …", model_name, WHISPER_DEVICE, WHISPER_COMPUTE)
-    whisper_model = WhisperModel(
-        model_name,
-        device=WHISPER_DEVICE,
-        compute_type=WHISPER_COMPUTE,
-    )
-    whisper_model_name = model_name
-    log.info("Whisper ready ✓  model=%s", model_name)
-
-
-@app.on_event("startup")
-async def load_models():
-    global vad_model, vad_utils
-
-    _load_whisper(WHISPER_MODEL)
-
-    log.info("Loading Silero VAD …")
-    # silero-vad v5 via torch.hub
-    vad_model, vad_utils = torch.hub.load(
-        repo_or_dir="snakers4/silero-vad",
-        model="silero_vad",
-        force_reload=False,
-        trust_repo=True,
-    )
-    log.info("VAD ready ✓")
-    log.info("Server ready — listening for connections")
 
 
 # ─────────────────────────────────────────────
-#  VAD helper
-# ─────────────────────────────────────────────
-VAD_CHUNK_SIZE = 512  # Silero VAD strictly requires 512 samples @ 16kHz
-
-def is_speech(pcm_float32: np.ndarray) -> float:
-    """Return VAD confidence for a 16kHz mono float32 array.
-
-    Silero VAD only accepts exactly 512 samples per call (at 16kHz).
-    We slice the input into 512-sample windows, run VAD on each, and
-    return the maximum confidence across all windows.
-    """
-    n = len(pcm_float32)
-    if n == 0:
-        return 0.0
-
-    max_conf = 0.0
-    with torch.no_grad():
-        for start in range(0, n, VAD_CHUNK_SIZE):
-            chunk = pcm_float32[start : start + VAD_CHUNK_SIZE]
-            # Pad the last window if it's shorter than VAD_CHUNK_SIZE
-            if len(chunk) < VAD_CHUNK_SIZE:
-                chunk = np.pad(chunk, (0, VAD_CHUNK_SIZE - len(chunk)))
-            tensor = torch.from_numpy(chunk).unsqueeze(0)  # (1, 512)
-            conf = vad_model(tensor, SAMPLE_RATE).item()
-            if conf > max_conf:
-                max_conf = conf
-    return max_conf
-
-
-# ─────────────────────────────────────────────
-#  Whisper ASR
+#  MLX-Whisper ASR
 # ─────────────────────────────────────────────
 def transcribe(pcm_float32: np.ndarray, source_lang: Optional[str] = None) -> str:
-    """Transcribe a PCM segment; returns stripped text."""
+    """Transcribe a 16kHz mono float32 PCM array using MLX-Whisper."""
+    import io
+    import wave
+    import tempfile
+
     t0 = time.perf_counter()
-    segments, info = whisper_model.transcribe(
-        pcm_float32,
-        language=source_lang,
-        beam_size=1,           # greedy decode = fastest; use 2-3 for slightly better quality
-        best_of=1,             # no sampling candidates needed at beam_size=1
-        vad_filter=False,      # we already handle VAD ourselves
-        without_timestamps=True,
-        condition_on_previous_text=False,  # avoids hallucination loops in short segments
-    )
-    text = " ".join(s.text for s in segments).strip()
+
+    # Convert float32 PCM to int16
+    pcm_int16 = np.clip(pcm_float32 * 32767, -32768, 32768).astype(np.int16)
+
+    # Create WAV file in memory
+    wav_io = io.BytesIO()
+    with wave.open(wav_io, 'wb') as wav_file:
+        wav_file.setnchannels(1)  # mono
+        wav_file.setsampwidth(2)  # 16-bit
+        wav_file.setframerate(SAMPLE_RATE)
+        wav_file.writeframes(pcm_int16.tobytes())
+    wav_io.seek(0)
+    wav_data = wav_io.read()
+
+    # MLX-Whisper 需要文件路径，创建临时文件
+    language = source_lang if source_lang else WHISPER_LANGUAGE
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+            tmp.write(wav_data)
+            tmp_path = tmp.name
+
+        # Transcribe with MLX-Whisper
+        result = mlx_whisper.transcribe(
+            tmp_path,
+            path_or_hf_repo=WHISPER_MODEL,
+            language=language,
+            verbose=False,
+        )
+
+        text = result.get("text", "").strip()
+
+        # Clean up temp file
+        os.unlink(tmp_path)
+
+    except Exception as exc:
+        log.error("MLX-Whisper error: %s", exc)
+        return ""
+
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    
-    # Log language detection info
-    detected_lang = info.language if hasattr(info, 'language') else 'unknown'
-    lang_prob = getattr(info, 'language_probability', 0)
-    log.info("ASR  %.0fms  src=%s  detected=%s (conf=%.2f)  model=%s  text='%s'",
-             elapsed_ms, source_lang, detected_lang, lang_prob, whisper_model_name, text[:80])
-    
+    detected_lang = result.get("language", language or "auto")
+    log.info("ASR  %.0fms  lang=%s  model=%s  text='%s'",
+             elapsed_ms, detected_lang, WHISPER_MODEL, text[:80])
     return text
+
+
+
 
 
 # ─────────────────────────────────────────────
@@ -331,6 +314,7 @@ async def interpret(ws: WebSocket):
     buffer_start_ts: float            = 0.0  # wall-clock time buffer started filling
     context_tail:    str              = ""   # last N words of previous translation
     anchors:         list[str]        = []   # semantic anchor list
+    energy_hangover: int              = 0    # energy VAD hangover counter
 
     # ── Per-connection configurable parameters ──────────────────
     src_lang          = None           # None = auto-detect
@@ -346,7 +330,7 @@ async def interpret(ws: WebSocket):
 
     async def _flush(reason: str):
         """Flush current audio buffer to ASR→LLM pipeline."""
-        nonlocal audio_buffer, silent_count, soft_pause_count, speech_frames, buffer_start_ts, context_tail
+        nonlocal audio_buffer, silent_count, soft_pause_count, speech_frames, buffer_start_ts, context_tail, energy_hangover
         if not audio_buffer or speech_frames < MIN_SPEECH_FRAMES:
             audio_buffer.clear()
             silent_count = soft_pause_count = speech_frames = 0
@@ -368,9 +352,11 @@ async def interpret(ws: WebSocket):
     # Send ready signal
     await ws.send_json({
         "type":    "ready",
-        "whisper": WHISPER_MODEL,
+        "asr":     "mlx-whisper",
+        "asr_model": WHISPER_MODEL,
         "llm":     llm_model,
         "message": "SyncVoice server ready",
+        "supported_langs": WHISPER_SUPPORTED_LANGS,
         "seg_params": {
             "silence_frames":     silence_frames,
             "max_buffer_secs":    max_buffer_secs,
@@ -393,11 +379,9 @@ async def interpret(ws: WebSocket):
                     if "silence_frames"     in ctrl: silence_frames     = int(ctrl["silence_frames"])
                     if "max_buffer_secs"    in ctrl: max_buffer_secs    = float(ctrl["max_buffer_secs"])
                     if "short_pause_frames" in ctrl: short_pause_frames = int(ctrl["short_pause_frames"])
-                    # Optional: hot-swap whisper model via WebSocket
-                    new_whisper = ctrl.get("whisper_model")
-                    if new_whisper and new_whisper != whisper_model_name and new_whisper in WHISPER_MODEL_OPTIONS:
-                        await ws.send_json({"type": "processing", "stage": "loading_whisper", "model": new_whisper})
-                        await asyncio.get_event_loop().run_in_executor(None, _load_whisper, new_whisper)
+                    # Validate src_lang against MLX-Whisper supported languages
+                    if src_lang and src_lang not in WHISPER_SUPPORTED_LANGS:
+                        log.warning("src_lang '%s' not in MLX-Whisper supported langs, will auto-detect", src_lang)
                     log.info("Config  %s→%s  llm=%s  sil=%d  max=%.1fs  short=%d",
                              src_lang, tgt_lang, llm_model, silence_frames, max_buffer_secs, short_pause_frames)
                     await ws.send_json({
@@ -405,7 +389,9 @@ async def interpret(ws: WebSocket):
                         "src_lang": src_lang,
                         "tgt_lang": tgt_lang,
                         "model": llm_model,
-                        "whisper_model": whisper_model_name,
+                        "asr": "mlx-whisper",
+                        "asr_model": WHISPER_MODEL,
+                        "supported_langs": WHISPER_SUPPORTED_LANGS,
                         "seg_params": {
                             "silence_frames":     silence_frames,
                             "max_buffer_secs":    max_buffer_secs,
@@ -432,7 +418,7 @@ async def interpret(ws: WebSocket):
                 pass  # Not JSON — fall through to audio path
 
             # ── Audio chunk (base64-encoded raw PCM float32 little-endian) ──
-            import base64
+
             try:
                 raw = base64.b64decode(message)
                 pcm = np.frombuffer(raw, dtype=np.float32).copy()
@@ -443,10 +429,21 @@ async def interpret(ws: WebSocket):
             if len(pcm) == 0:
                 continue
 
-            # ── VAD ──────────────────────────────────────────────
-            vad_conf = is_speech(pcm)
-            is_voice  = vad_conf >= VAD_THRESHOLD
-            is_soft   = (not is_voice) and (vad_conf >= SHORT_PAUSE_THRESHOLD)
+            # ── Energy-based VAD ──────────────────────────────────
+            rms = float(np.sqrt(np.mean(pcm ** 2)))
+            raw_voice = rms >= ENERGY_VAD_THRESHOLD
+
+            # Hangover: keep voice=True for a few frames after energy drops
+            # (avoids cutting off trailing consonants / word endings)
+            if raw_voice:
+                energy_hangover = ENERGY_VAD_HANGOVER
+            elif energy_hangover > 0:
+                energy_hangover -= 1
+
+            is_voice = raw_voice or (energy_hangover > 0)
+            # "soft silence": energy dropped but hangover still active
+            is_soft  = (not raw_voice) and (energy_hangover > 0)
+            vad_conf = min(1.0, rms / max(ENERGY_VAD_THRESHOLD, 1e-9))
 
             buf_s = _buf_secs()
             await ws.send_json({
@@ -557,30 +554,14 @@ async def _process_segment(
 @app.get("/health")
 async def health():
     return {
-        "status":        "ok",
-        "whisper":       whisper_model_name,
-        "whisper_opts":  WHISPER_MODEL_OPTIONS,
-        "ollama":        OLLAMA_BASE_URL,
-        "llm":           DEFAULT_LLM,
-        "llm_opts":      LLM_MODEL_OPTIONS,
+        "status":           "ok",
+        "asr":              "mlx-whisper",
+        "asr_model":        WHISPER_MODEL,
+        "asr_langs":       WHISPER_SUPPORTED_LANGS,
+        "ollama":           OLLAMA_BASE_URL,
+        "llm":              DEFAULT_LLM,
+        "llm_opts":         LLM_MODEL_OPTIONS,
     }
-
-
-@app.post("/config/whisper")
-async def switch_whisper(model: str):
-    """Hot-swap the Whisper model without restarting the server.
-
-    Example: POST /config/whisper?model=base
-    Supported: tiny | base | small | medium | large-v3 | distil-large-v3
-    """
-    if model not in WHISPER_MODEL_OPTIONS:
-        return {"error": f"Unknown model '{model}'. Choose from: {WHISPER_MODEL_OPTIONS}"}
-    try:
-        await asyncio.get_event_loop().run_in_executor(None, _load_whisper, model)
-        return {"status": "ok", "whisper": whisper_model_name}
-    except Exception as exc:
-        log.error("Failed to load whisper model %s: %s", model, exc)
-        return {"error": str(exc)}
 
 
 @app.get("/models")
@@ -590,9 +571,18 @@ async def list_models():
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
             data = resp.json()
-            # Inject local whisper info
-            data["whisper_current"] = whisper_model_name
-            data["whisper_options"] = WHISPER_MODEL_OPTIONS
+            # Inject local ASR info
+            data["asr"]         = "mlx-whisper"
+            data["asr_model"]   = WHISPER_MODEL
+            data["asr_langs"]  = WHISPER_SUPPORTED_LANGS
             return data
     except Exception as exc:
         return {"error": str(exc)}
+
+
+# ─────────────────────────────────────────────
+#  Entry point
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=5500, reload=True)

@@ -625,7 +625,7 @@
     <div class="pipeline-banner">
       <div class="pipe-step" id="pipeAsr">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
-        Whisper ASR
+        Cohere ASR
       </div>
       <span class="pipe-arrow">→</span>
       <div class="pipe-step" id="pipeVad">
@@ -764,7 +764,7 @@
         <div class="srow">
           <div class="srow-label"><span>WebSocket 地址</span></div>
           <div class="url-row">
-            <input class="url-input" id="wsUrl" value="ws://localhost:8765/ws/interpret" />
+            <input class="url-input" id="wsUrl" value="ws://localhost:5500/ws/interpret" />
             <button class="url-btn" onclick="toggleConnect()">连接</button>
           </div>
         </div>
@@ -791,52 +791,41 @@
         </div>
         <div class="srow">
           <div class="srow-label">
-            <span>Whisper ASR 模型</span>
-            <span class="srow-val" id="whisperModelLabel">small</span>
+            <span>ASR 引擎</span>
+            <span class="srow-val" style="color:var(--accent-purple)">Cohere</span>
           </div>
-          <select id="whisperModelSelect" style="width:100%;background:var(--bg-base);color:var(--text-primary);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:12px;margin-top:4px;cursor:pointer;" onchange="selectWhisperModel(this.value)">
-            <option value="tiny">tiny — 极速 ~0.3s，精度低</option>
-            <option value="base">base — 超快 ~0.5s，日常口语推荐</option>
-            <option value="small" selected>small — 快 ~1-2s，同传最佳平衡 ★</option>
-            <option value="medium">medium — 中速 ~4-6s，精度高</option>
-            <option value="large-v3">large-v3 — 慢 ~20s，最高精度</option>
-          </select>
-          <div style="font-size:11px;color:var(--text-muted);margin-top:4px;line-height:1.4;" id="whisperHint">
-            同传推荐 small，切换后服务器需重新加载模型（约数秒）
+          <div style="background:var(--bg-elevated);border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-top:4px;">
+            <div style="font-size:12px;font-weight:600;color:var(--text-primary);margin-bottom:2px;">cohere-transcribe-03-2026</div>
+            <div style="font-size:11px;color:var(--text-muted);">2B params · MPS 加速 · 本地推理</div>
           </div>
         </div>
 
-        <!-- WhisperX upgrade tip -->
+        <!-- Cohere Transcribe info -->
         <div style="background:rgba(167,139,250,0.06);border:1px solid rgba(167,139,250,0.2);border-radius:7px;padding:10px 12px;">
           <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
             <svg viewBox="0 0 24 24" fill="none" stroke="var(--accent-purple)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:11px;height:11px;flex-shrink:0"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-            <span style="font-size:10px;font-family:'Space Mono',monospace;color:var(--accent-purple);letter-spacing:0.08em;text-transform:uppercase;font-weight:700;">WhisperX 升级建议</span>
+            <span style="font-size:10px;font-family:'Space Mono',monospace;color:var(--accent-purple);letter-spacing:0.08em;text-transform:uppercase;font-weight:700;">Cohere Transcribe 特性</span>
           </div>
-          <div style="font-size:11px;color:var(--text-secondary);line-height:1.6;">
-            当前使用 <b style="color:var(--text-primary)">Faster-Whisper</b>（每句话转录后再翻译）。
-            如需进一步降低延迟、提升长句断句精度，可考虑切换至
-            <b style="color:var(--accent-purple)">WhisperX</b>：
-          </div>
-          <div style="margin-top:7px;display:flex;flex-direction:column;gap:4px;">
+          <div style="margin-top:4px;display:flex;flex-direction:column;gap:4px;">
             <div style="display:flex;gap:6px;align-items:flex-start;font-size:11px;color:var(--text-secondary);">
               <span style="color:var(--accent-green);margin-top:1px;flex-shrink:0">✓</span>
-              <span><b style="color:var(--text-primary)">词级时间戳</b> — 精确到单词的时间对齐，便于字幕同步</span>
+              <span><b style="color:var(--text-primary)">14 种语言</b> — 含荷兰语(nl)、中文(zh)、日语等，WER 业界领先</span>
             </div>
             <div style="display:flex;gap:6px;align-items:flex-start;font-size:11px;color:var(--text-secondary);">
               <span style="color:var(--accent-green);margin-top:1px;flex-shrink:0">✓</span>
-              <span><b style="color:var(--text-primary)">批处理加速</b> — batch_size=16 可额外提升 2-4× 速度</span>
+              <span><b style="color:var(--text-primary)">Apple MPS 加速</b> — M 系列芯片 GPU 推理，速度大幅优于 CPU</span>
             </div>
             <div style="display:flex;gap:6px;align-items:flex-start;font-size:11px;color:var(--text-secondary);">
               <span style="color:var(--accent-green);margin-top:1px;flex-shrink:0">✓</span>
-              <span><b style="color:var(--text-primary)">说话人分离</b> — 自动区分多人对话（需 pyannote.audio）</span>
+              <span><b style="color:var(--text-primary)">开源 Apache 2.0</b> — 完全本地运行，无需 API Key</span>
             </div>
             <div style="display:flex;gap:6px;align-items:flex-start;font-size:11px;color:var(--text-secondary);">
               <span style="color:var(--accent-amber);margin-top:1px;flex-shrink:0">⚠</span>
-              <span>需要额外安装 <code style="background:var(--bg-base);padding:1px 4px;border-radius:3px;font-size:10px;">pip install whisperx</code> 并修改服务端代码</span>
+              <span>必须指定语言代码，不支持自动语言检测</span>
             </div>
           </div>
           <div style="margin-top:8px;padding-top:7px;border-top:1px solid rgba(167,139,250,0.15);">
-            <a href="https://github.com/m-bain/whisperX" target="_blank" style="color:var(--accent-purple);font-size:11px;text-decoration:none;">WhisperX GitHub ↗</a>
+            <a href="https://huggingface.co/CohereLabs/cohere-transcribe-03-2026" target="_blank" style="color:var(--accent-purple);font-size:11px;text-decoration:none;">HuggingFace 模型页 ↗</a>
           </div>
         </div>
       </div>
@@ -1752,21 +1741,6 @@ function selectModel(el, name){
   currentModel = name;
   document.getElementById('sideModelName').textContent = name;
   sendConfig();
-}
-function selectWhisperModel(modelName){
-  document.getElementById('whisperModelLabel').textContent = modelName;
-  const hints = {
-    tiny:       '极速，适合口音清晰的简短句子，错字率较高',
-    base:       '超快，日常普通话/英语效果不错',
-    small:      '同传最佳平衡：速度快、准确率高 ★',
-    medium:     '高精度，延迟约 4-6s，适合质量优先场景',
-    'large-v3': '最高精度，但延迟约 20s，不适合实时同传',
-  };
-  document.getElementById('whisperHint').textContent = (hints[modelName] || '') + '  — 切换后服务器需重新加载模型';
-  // Send to backend via WebSocket
-  if(ws && ws.readyState === WebSocket.OPEN){
-    ws.send(JSON.stringify({ type:'config', whisper_model: modelName }));
-  }
 }
 function setSegOpt(el){
   el.closest('.seg').querySelectorAll('.seg-opt').forEach(o=>o.classList.remove('on'));
